@@ -3,7 +3,7 @@
 A ROS2 package for controlling multiple Boston Dynamics Spot robots with fiducial-based localization.
 
 Changelogs:
-- 09-29-2025: initial documentation by claude.
+- 09-29-2025: initial documentation by claude and modified by wyc for correctness.
 
 ## Setup Instructions
 
@@ -26,17 +26,17 @@ cd spot_ros2
 ### 3. Clone and Setup ROS Sharp
 
 ```bash
-cd ~/ros2_ws/src
+cd ~
 git clone https://github.com/siemens/ros-sharp.git
 # Copy over file_server2 (adjust path as needed)
-cp -r /path/to/file_server2 ~/ros2_ws/src/
+cp -r "ros-sharp/ROS Packages/ROS2/file_server2" ~/ros2_ws/src/
 ```
 
 ### 4. Clone This Repository
 
 ```bash
 cd ~/ros2_ws/src
-git clone <this-repo-url> spot_multi
+git clone github.com/h2r/spot_ros2_multi spot_multi
 ```
 
 ### 5. Build the Workspace
@@ -179,13 +179,18 @@ source install/setup.zsh
 ros2 launch file_server2 ros_sharp_communication.launch.py
 ```
 
-### Terminal 4: Run Fiducial Localization
+### Terminal 4: Run Fiducial Localization or GraphNav Localization
 ```bash
 cd ~/ros2_ws
 source install/setup.zsh
 cd src/spot_multi/scripts
-python3 spot_fiducial_loc.py
 ```
+
+Then,
+- If fiducial: `python3 spot_fiducial_loc.py`
+- If graphnav: `python3 spot_graphnav_loc.py`
+
+
 
 ## Notes
 
