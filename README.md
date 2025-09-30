@@ -107,55 +107,6 @@ Create the following configuration files in `~/spot_configs/`:
     publish_graph_nav_pose: True
 ```
 
-### spot_tusker.yaml
-```yaml
-/**:
-  ros__parameters:
-    # Spot Login Information
-    username: "user"
-    password: "your_spot_password"
-    hostname: "192.168.1.101"  # Replace with your second Spot's IP
-
-    # Status Updates from Spot
-    metrics_rate: 0.04
-    lease_rate: 1.0
-    async_tasks_rate: 10.0
-    robot_state_rate: 50.0
-    image_rate: 10.0
-
-    # Boolean parameters
-    auto_claim: True
-    auto_power_on: False
-    auto_stand: False
-
-    # Estop Parameters
-    estop_timeout: 9.0
-    start_estop: False
-
-    preferred_odom_frame: "vision"
-    tf_root: "body"
-
-    # Robot identification
-    spot_name: "tusker"
-
-    cmd_duration: 0.25
-    arm_cmd_duration: 1.0
-    rgb_cameras: True
-    initialize_spot_cam: False
-
-    use_velodyne: True
-    velodyne_rate: 10.0
-
-    # Virtual camera parameters for image stitching
-    virtual_camera_intrinsics: [385.0, 0.0, 315.0, 0.0, 385.0, 844.0, 0.0, 0.0, 1.0]
-    virtual_camera_projection_plane: [-0.15916, 0.0, 0.987253]
-    virtual_camera_plane_distance: 0.5
-    stitched_image_row_padding: 1182
-
-    gripperless: False
-    publish_graph_nav_pose: True
-```
-
 ## Running the System
 
 ### Terminal 1: Source and Launch Spot Gouger
@@ -184,12 +135,17 @@ ros2 launch file_server2 ros_sharp_communication.launch.py
 cd ~/ros2_ws
 source install/setup.zsh
 cd src/spot_multi/scripts
+python3 spot_graphnav_loc.py
 ```
 
-Then,
-- If fiducial: `python3 spot_fiducial_loc.py`
-- If graphnav: `python3 spot_graphnav_loc.py`
-
+### Terminal 5: Run ICP of the point clouds.
+```bash
+cd ~/ros2_ws
+source install/setup.zsh
+ros2 run spot_multi point_cloud_processor
+```
+Currently, the ICP uses hard-coded topic names. You may edit the cpp source code to change
+the topics. In the future, it will be re-written to be more general.
 
 
 ## Notes
