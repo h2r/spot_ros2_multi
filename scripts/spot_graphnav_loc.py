@@ -82,7 +82,9 @@ class SpotGraphNavLocalization(Node):
             return
 
         self.get_logger().debug(f"Updating spot {spot2} GraphNav offset with lidar point cloud icp")
-        self.icp_alignment_offset[spot2] = self.tf_to_matrix(msg)
+        offset_mat = self.tf_to_matrix(msg)
+        offset_mat[2, 3] = 0
+        self.icp_alignment_offset[spot2] = offset_mat
     
     def tf_to_matrix(self, tf: TransformStamped) -> np.ndarray:
         quat = [tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w]
