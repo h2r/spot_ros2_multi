@@ -16,6 +16,7 @@ find_package(message_filters REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io registration)
+find_package(small_gicp REQUIRED)
 
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
@@ -32,7 +33,10 @@ ament_target_dependencies(point_cloud_processor
   pcl_conversions
   pcl_ros
 )
-target_link_libraries(point_cloud_processor ${PCL_LIBRARIES})
+target_link_libraries(point_cloud_processor
+  ${PCL_LIBRARIES}
+  small_gicp::small_gicp
+)
 
 install(TARGETS
   point_cloud_processor

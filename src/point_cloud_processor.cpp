@@ -18,7 +18,7 @@
 #include <pcl/point_types.h>
 #include <pcl/registration/icp.h>
 #include <pcl_conversions/pcl_conversions.h>
-
+#include <small_gicp/pcl/pcl_registration.hpp>
 
 
 /*
@@ -46,7 +46,7 @@ public:
 
         // Create synchronizer with approximate time policy
         sync_ = std::make_shared<message_filters::Synchronizer<ApproxSyncPolicy>>(
-            ApproxSyncPolicy(5), sub_pc1_, sub_pc2_);
+            ApproxSyncPolicy(1), sub_pc1_, sub_pc2_);
         sync_->registerCallback(
             std::bind(&PointCloudProcessor::syncCallback, this,
                      std::placeholders::_1, std::placeholders::_2));
@@ -83,10 +83,16 @@ private:
         // Run ICP to refine alignment
         pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_cloud2(new pcl::PointCloud<pcl::PointXYZ>);
         Eigen::Matrix4f cloud2_align_tf;
-        if (!performICP(pcl_cloud1, pcl_cloud2, aligned_cloud2, cloud2_align_tf)) {
-            RCLCPP_WARN(this->get_logger(), "ICP registration failed");
+        auto start = std::chrono::high_resolution_clock::now();
+        bool icp_success = performICP(pcl_cloud1, pcl_cloud2, aligned_cloud2, cloud2_align_tf);
+        auto stop = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(stop - start);
+        if (!icp_success) {
+            RCLCPP_WARN(this->get_logger(),
+                ("ICP registration failed after " + std::to_string(duration.count()) + " seconds.").c_str());
             return;
         }
+        RCLCPP_INFO(this->get_logger(), ("ICP took " + std::to_string(duration.count()) + " seconds.").c_str());
 
         // Log the transformation matrix
         RCLCPP_INFO(this->get_logger(), "ICP Transformation:");
@@ -143,6 +149,14 @@ private:
         publisher_realigned2_->publish(realigned2_msg);
     }
 
+    bool filterSpotBody(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, 
+                        const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered)
+    {
+        return false; // TODO
+
+
+    }
+
     bool transformToMap(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& input,
                        sensor_msgs::msg::PointCloud2& output)
     {
@@ -168,12 +182,15 @@ private:
                    Eigen::Matrix4f& transformation)
     {
         pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+        // small_gicp::RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ> icp;
+        // icp.setNumThreads(4);
 
         // Set ICP parameters
         icp.setMaximumIterations(50);
         icp.setTransformationEpsilon(1e-8);
         icp.setMaxCorrespondenceDistance(0.5);  // 50cm max correspondence
         icp.setEuclideanFitnessEpsilon(1e-5);
+        // icp.setRegistrationType("VGICP");
 
         // Set source and target
         icp.setInputSource(target);  // Cloud 2 (to be aligned)
