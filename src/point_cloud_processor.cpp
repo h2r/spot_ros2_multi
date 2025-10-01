@@ -84,35 +84,30 @@ private:
         pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_cloud2(new pcl::PointCloud<pcl::PointXYZ>);
         Eigen::Matrix4f cloud2_align_tf;
         auto start = std::chrono::high_resolution_clock::now();
-        bool icp_success = performICP(pcl_cloud1, pcl_cloud2, aligned_cloud2, cloud2_align_tf);
+        auto [icp_result, icp_score] = performICP(pcl_cloud1, pcl_cloud2, aligned_cloud2, cloud2_align_tf);
         auto stop = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(stop - start);
-        if (!icp_success) {
+        if (!icp_result) {
             RCLCPP_WARN(this->get_logger(),
                 ("ICP registration failed after " + std::to_string(duration.count()) + " seconds.").c_str());
             return;
+        } else if (icp_score > icp_threshold_) {
+            RCLCPP_WARN(this->get_logger(), 
+                ("ICP Score above threshold " + std::to_string(icp_threshold_) + ". Rejecting ICP result.").c_str());
+            return;
         }
         RCLCPP_INFO(this->get_logger(), ("ICP took " + std::to_string(duration.count()) + " seconds.").c_str());
-
-        // Log the transformation matrix
-        RCLCPP_INFO(this->get_logger(), "ICP Transformation:");
-        // RCLCPP_INFO(this->get_logger(), "[%f, %f, %f, %f]",
-        //             cloud2_align_tf(0,0), cloud2_align_tf(0,1), cloud2_align_tf(0,2), cloud2_align_tf(0,3));
-        // RCLCPP_INFO(this->get_logger(), "[%f, %f, %f, %f]",
-        //             cloud2_align_tf(1,0), cloud2_align_tf(1,1), cloud2_align_tf(1,2), cloud2_align_tf(1,3));
-        // RCLCPP_INFO(this->get_logger(), "[%f, %f, %f, %f]",
-        //             cloud2_align_tf(2,0), cloud2_align_tf(2,1), cloud2_align_tf(2,2), cloud2_align_tf(2,3));
-        // RCLCPP_INFO(this->get_logger(), "[%f, %f, %f, %f]",
-        //             cloud2_align_tf(3,0), cloud2_align_tf(3,1), cloud2_align_tf(3,2), cloud2_align_tf(3,3));
 
         // Convert to quaternion and translation
         Eigen::Matrix3f rotation = cloud2_align_tf.block<3,3>(0,0);
         Eigen::Quaternionf quat(rotation);
         Eigen::Vector3f translation = cloud2_align_tf.block<3,1>(0,3);
 
-        RCLCPP_INFO(this->get_logger(), "Translation: [x: %f, y: %f, z: %f]",
+        // Log the transformation matrix
+        RCLCPP_INFO(this->get_logger(), "ICP Transformation:");
+        RCLCPP_INFO(this->get_logger(), "    Translation: [x: %f, y: %f, z: %f]",
                     translation.x(), translation.y(), translation.z());
-        RCLCPP_INFO(this->get_logger(), "Rotation (quaternion): [x: %f, y: %f, z: %f, w: %f]",
+        RCLCPP_INFO(this->get_logger(), "    Rotation (quaternion): [x: %f, y: %f, z: %f, w: %f]",
                     quat.x(), quat.y(), quat.z(), quat.w());
 
         // Merge the point clouds
@@ -176,7 +171,7 @@ private:
         }
     }
 
-    bool performICP(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source,
+    std::pair<bool, float> performICP(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source,
                    const pcl::PointCloud<pcl::PointXYZ>::Ptr& target,
                    pcl::PointCloud<pcl::PointXYZ>::Ptr& aligned,
                    Eigen::Matrix4f& transformation)
@@ -188,7 +183,7 @@ private:
         // Set ICP parameters
         icp.setMaximumIterations(50);
         icp.setTransformationEpsilon(1e-8);
-        icp.setMaxCorrespondenceDistance(0.5);  // 50cm max correspondence
+        icp.setMaxCorrespondenceDistance(0.05);  // 50cm max correspondence
         icp.setEuclideanFitnessEpsilon(1e-5);
         // icp.setRegistrationType("VGICP");
 
@@ -203,10 +198,10 @@ private:
             transformation = icp.getFinalTransformation();
             RCLCPP_INFO(this->get_logger(),
                        "ICP converged. Score: %f", icp.getFitnessScore());
-            return true;
+            return std::make_pair<bool, float>(true, icp.getFitnessScore());
         }
 
-        return false;
+        return std::make_pair<bool, float>(false, -1);
     }
 
     message_filters::Subscriber<sensor_msgs::msg::PointCloud2> sub_pc1_;
@@ -219,6 +214,8 @@ private:
 
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+    double icp_threshold_ = 1.0;
 };
 
 int main(int argc, char** argv)
