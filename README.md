@@ -130,22 +130,17 @@ source install/setup.zsh
 ros2 launch file_server2 ros_sharp_communication.launch.py
 ```
 
-### Terminal 4: Run Fiducial Localization or GraphNav Localization
+### Terminal 4: Run GraphNav Localization, ICP of the Point clouds, and sync drive.
 ```bash
 cd ~/ros2_ws
 source install/setup.zsh
-cd src/spot_multi/scripts
-python3 spot_graphnav_loc.py
+ros2 launch spot_multi spot_multi.launch.py
 ```
-
-### Terminal 5: Run ICP of the point clouds.
-```bash
-cd ~/ros2_ws
-source install/setup.zsh
-ros2 run spot_multi point_cloud_processor
-```
-Currently, the ICP uses hard-coded topic names. You may edit the cpp source code to change
-the topics. In the future, it will be re-written to be more general.
+- GraphNav base localization is used. Lidar ICP registration will be applied on top of GraphNav
+  in `/spot_tf_compute` only, for unity consumption.
+- Currently, the ICP uses hard-coded topic names. You may edit the cpp source code to change
+  the topics. In the future, it will be re-written to be more general.
+- Currently, the `/multi_spot/cmd_vel` is velocity based, which is not stable enough.
 
 
 ## Notes
