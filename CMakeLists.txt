@@ -58,7 +58,7 @@ endif()
 ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
-  scripts/spot_fiducial_loc.py
+  scripts/spot_sync_drive.py
   DESTINATION lib/${PROJECT_NAME}
 )
 install(PROGRAMS
