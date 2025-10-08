@@ -110,23 +110,30 @@ class SpotGraphNavLocalization(Node):
     
     def publish_transform(self):
         for spot in self.spots:
-            if spot == self.pivot_spot:
-                continue
             try:
-                spot1_tf = self.tf_buffer.lookup_transform('map', f'{self.pivot_spot}/body', rclpy.time.Time())
-                spot2_tf = self.tf_buffer.lookup_transform('map', f'{spot}/body', rclpy.time.Time())
-                spot1_R = self.tf_to_matrix(spot1_tf)
-                spot2_R = self.tf_to_matrix(spot2_tf)
+                spot_pivot_tf = self.tf_buffer.lookup_transform('map', f'{self.pivot_spot}/body', rclpy.time.Time())
+                spot_curr_tf = self.tf_buffer.lookup_transform('map', f'{spot}/body', rclpy.time.Time())
+                spot_pivot_R = self.tf_to_matrix(spot_pivot_tf)
+                spot_curr_R = self.tf_to_matrix(spot_curr_tf)
             except Exception as e:
                 self.get_logger().info(f'Waiting for transforms for {spot}...')
                 return
+            
+            # publish map to body transform with ICP correction and without ICP correction
+            map_T_spot_icp = spot_curr_R @ self.icp_alignment_offset[self.pivot_spot]
+            map_T_spot_msg = self.matrix_to_tf(map_T_spot_icp, 'map', f'{spot}/body')
+            map_T_spot_orig_msg = self.matrix_to_tf(spot_curr_R, 'map', f'{spot}/body_orig')
+            self.tf_publisher.publish(map_T_spot_msg)
+            self.tf_publisher.publish(map_T_spot_orig_msg)
 
-            spot1_T_spot2_icp = np.linalg.inv(spot1_R) @ self.icp_alignment_offset[spot] @ spot2_R
-            spot1_T_spot2 = np.linalg.solve(spot1_R, spot2_R)  # without ICP correction
-            tf_msg1 = self.matrix_to_tf(spot1_T_spot2_icp, f'{self.pivot_spot}/body', f'{spot}/body')
-            tf_msg2 = self.matrix_to_tf(spot1_T_spot2, f'{self.pivot_spot}/body', f'{spot}/body_orig')
-            self.tf_publisher.publish(tf_msg1)
-            self.tf_publisher.publish(tf_msg2)
+            # publish spot1 to spot2 transform with ICP correction and without ICP correction
+            if spot != self.pivot_spot:
+                spot1_T_spot2_icp = np.linalg.inv(spot_pivot_R) @ self.icp_alignment_offset[spot] @ spot_curr_R
+                spot1_T_spot2 = np.linalg.solve(spot_pivot_R, spot_curr_R)  # without ICP correction
+                tf_msg1 = self.matrix_to_tf(spot1_T_spot2_icp, f'{self.pivot_spot}/body', f'{spot}/body')
+                tf_msg2 = self.matrix_to_tf(spot1_T_spot2, f'{self.pivot_spot}/body', f'{spot}/body_orig')
+                self.tf_publisher.publish(tf_msg1)
+                self.tf_publisher.publish(tf_msg2)
 
 
 def main(args=None):
