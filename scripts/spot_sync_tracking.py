@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from typing import Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -64,6 +65,8 @@ class SpotSyncTracking(Node):
         self.trajectory_futures = {}
         self.trajectory_feedback = {}
 
+        self.pivot_to_robot_R: Optional[dict[str, np.ndarray]] = None
+
         for spot_name in spot_names:
             client = ActionClient(self, Trajectory, f"/{spot_name}/trajectory")
             self.trajectory_clients[spot_name] = client
@@ -93,6 +96,7 @@ class SpotSyncTracking(Node):
         self.current_cmd_vel = Twist()
         self.last_cmd_vel_time = None
         self.cmd_vel_lock = threading.Lock()
+        self.pivot_lock = threading.Lock()
         self.stop_command_sent = False  # Track if we've already sent stop
 
         # Timer for periodic trajectory updates
@@ -113,7 +117,7 @@ class SpotSyncTracking(Node):
             )
 
     def get_robot_transforms(self):
-        """Get current transforms for all robots in the map frame"""
+        """Get current transforms for all robots in the map frame, dict of R and 3D locations"""
         robot_tfs = {}
         robot_locs = {}
 
@@ -132,6 +136,21 @@ class SpotSyncTracking(Node):
 
         return robot_tfs, robot_locs
 
+    
+    def compute_tf_to_pivot(self, robot_tfs, robot_locs):
+        """Compute and store transforms from each robot to the pivot frame"""
+        if self.pivot_to_robot_R is not None: return
+        with self.pivot_lock:
+            self.pivot_to_robot_R = {}
+            robot_pivot = np.array(list(robot_locs.values())).mean(axis=0)
+            robot_pivot_R = np.eye(4)
+            robot_pivot_R[:3, :3] = robot_tfs[self.base_spot_name][:3, :3]
+            robot_pivot_R[:3, 3] = robot_pivot
+            for spot_name in self.spot_names:
+                pivot_to_robot_R = np.linalg.solve(robot_pivot_R, robot_tfs[spot_name])
+                self.pivot_to_robot_R[spot_name] = pivot_to_robot_R
+
+    
     def compute_formation_pivot(self, robot_tfs, robot_locs):
         """
         Compute the pivot point for the robot formation.
@@ -164,15 +183,14 @@ class SpotSyncTracking(Node):
             else:
                 self.get_logger().debug(f"No active trajectory to cancel for {spot_name}")
 
-    def compute_target_pose_for_robot(self, spot_name, robot_tfs, robot_locs,
-                                      robot_pivot_R, robot_pivot, cmd_vel):
+    def compute_target_pose_for_robot(self, spot_name: str, robot_R: np.ndarray,
+                                      robot_pivot_R: np.ndarray, robot_pivot: np.ndarray, cmd_vel: Twist):
         """
         Compute target pose for a single robot based on formation velocity command.
 
         Args:
             spot_name: Name of the robot
-            robot_tfs: Dict of current robot transforms
-            robot_locs: Dict of current robot positions
+            robot_R: Current robot transformation matrix
             robot_pivot_R: Formation pivot transformation matrix
             robot_pivot: Formation pivot position
             cmd_vel: Formation velocity command
@@ -189,9 +207,9 @@ class SpotSyncTracking(Node):
             angular_speed = self.max_angular_speed * np.sign(angular_speed)
 
         # Transform to robot's frame
-        relative_R = np.linalg.inv(robot_tfs[spot_name]) @ robot_pivot_R
+        relative_R = np.linalg.inv(robot_R) @ robot_pivot_R
         relative_xyz = relative_R[:3, 3]
-        radius = np.linalg.norm(robot_locs[spot_name] - robot_pivot)
+        radius = np.linalg.norm(robot_R[:3, 3] - robot_pivot)
 
         # Compute linear velocity in robot frame
         new_linear_vel = relative_R[:3, :3] @ global_linear_vel
@@ -266,6 +284,7 @@ class SpotSyncTracking(Node):
                     )
                     self.send_stop_command()
                     with self.cmd_vel_lock:
+                        self.pivot_to_robot_R = None  # Reset pivot transforms
                         self.stop_command_sent = True
                 return
 
@@ -286,12 +305,20 @@ class SpotSyncTracking(Node):
 
         # Compute formation pivot
         robot_pivot_R, robot_pivot = self.compute_formation_pivot(robot_tfs, robot_locs)
+        if self.pivot_to_robot_R is None:
+            self.compute_tf_to_pivot(robot_tfs, robot_locs)
 
         # Generate and send trajectory goals for each robot
         for spot_name in self.spot_names:
+            if self.pivot_to_robot_R is None:
+                raise ValueError("pivot_to_robot_R not computed yet")
+
+            # adjust the robot position to be consistent with the inital pivot offset when the
+            # cmd_vel was first received
+            adjusted_robot_R = robot_pivot_R @ self.pivot_to_robot_R[spot_name]
             # Compute target pose
             target_pose = self.compute_target_pose_for_robot(
-                spot_name, robot_tfs, robot_locs,
+                spot_name, adjusted_robot_R,
                 robot_pivot_R, robot_pivot, cmd_vel
             )
 
