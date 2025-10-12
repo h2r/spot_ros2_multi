@@ -8,6 +8,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 import tf2_ros
+import tf2_geometry_msgs  # Required for PoseStamped transformations
 import tf_transformations as tf_trans
 import numpy as np
 import threading
@@ -61,7 +62,7 @@ class SpotSyncTracking(Node):
         self.spot_names = spot_names
         self.base_spot_name = spot_names[0]
 
-        self.mock = True
+        self.mock = False
 
         # Create action clients for each robot
         self.trajectory_clients = {}
@@ -145,6 +146,7 @@ class SpotSyncTracking(Node):
     def compute_tf_to_pivot(self, robot_tfs, robot_locs):
         """Compute and store transforms from each robot to the pivot frame"""
         if self.pivot_to_robot_R is not None: return
+        print(robot_locs)
         with self.pivot_lock:
             self.get_logger().info("--- New Command Session -- computing pivot transforms")
             self.pivot_to_robot_R = {}
@@ -152,8 +154,11 @@ class SpotSyncTracking(Node):
             robot_pivot_R = np.eye(4)
             robot_pivot_R[:3, :3] = robot_tfs[self.base_spot_name][:3, :3]
             robot_pivot_R[:3, 3] = robot_pivot
+            print(f"Robot pivot at: {robot_pivot}")
             for spot_name in self.spot_names:
                 pivot_to_robot_R = np.linalg.solve(robot_pivot_R, robot_tfs[spot_name])
+                print(f"{spot_name} pivot offset: {pivot_to_robot_R[:3,3]}")
+                print(f"{spot_name} transform:\n{robot_tfs[spot_name]}")
                 self.pivot_to_robot_R[spot_name] = pivot_to_robot_R
 
     
@@ -204,55 +209,34 @@ class SpotSyncTracking(Node):
         Returns:
             PoseStamped in robot's body frame for the trajectory goal
         """
+        assert self.pivot_to_robot_R is not None, "pivot_to_robot_R not computed"
         # Get velocity components
         global_linear_vel = np.array([cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.linear.z])
         angular_speed = cmd_vel.angular.z
 
-        # Cap speeds
-        if np.abs(angular_speed) > self.max_angular_speed:
-            angular_speed = self.max_angular_speed * np.sign(angular_speed)
+        # compute new location of the pivot after trajectory_duration
+        dt = self.trajectory_duration
+        new_pivot = robot_pivot + global_linear_vel * dt
+        rot_mat = np.eye(4)
+        # rotate the pivot around the z axis
+        if abs(angular_speed) > 0.001:
+            angle = angular_speed * dt
+            rot_mat[:3, :3] = [
+                [np.cos(angle), -np.sin(angle), 0],
+                [np.sin(angle),  np.cos(angle), 0],
+                [0,             0,              1]
+            ]
+        new_pivot_R = robot_pivot_R @ rot_mat
+        new_pivot_R[:3, 3] = new_pivot
 
-        # Transform to robot's frame
-        relative_R = np.linalg.inv(robot_R) @ robot_pivot_R
-        relative_xyz = relative_R[:3, 3]
-        radius = np.linalg.norm(robot_R[:3, 3] - robot_pivot)
-
-        # Compute linear velocity in robot frame
-        new_linear_vel = relative_R[:3, :3] @ global_linear_vel
-
-        # Add rotational component
-        linear_rotation_vel_magnitude = radius * angular_speed
-        linear_rotation_vel_vec = np.array([relative_xyz[1], -relative_xyz[0], 0.0])
-
-        if np.linalg.norm(linear_rotation_vel_vec) > 1e-6:
-            linear_rotation_vel_vec /= np.linalg.norm(linear_rotation_vel_vec)
-        else:
-            linear_rotation_vel_vec = np.array([0.0, 0.0, 0.0])
-
-        linear_rotation_vel_vec *= linear_rotation_vel_magnitude
-
-        # Compensate for robot's differential response to x/y velocities
-        linear_rotation_vel_vec[0] *= (1.0 + np.abs(linear_rotation_vel_vec[1] * 0.05))
-
-        # Total velocity
-        total_linear_vel = new_linear_vel + linear_rotation_vel_vec
-
-        # Cap linear speed
-        if np.linalg.norm(total_linear_vel) > self.max_linear_speed:
-            total_linear_vel = total_linear_vel / np.linalg.norm(total_linear_vel) * self.max_linear_speed
-
-        # Integrate velocity to get target position (in robot's current body frame)
-        target_x = total_linear_vel[0] * self.trajectory_duration
-        target_y = total_linear_vel[1] * self.trajectory_duration
-        target_z = 0.0
-
-        # Target orientation from angular velocity
-        target_yaw = angular_speed * self.trajectory_duration
-        target_quat = tf_trans.quaternion_from_euler(0, 0, target_yaw)
+        target_R = new_pivot_R @ self.pivot_to_robot_R[spot_name]
+        target_x, target_y, target_z = target_R[:3, 3]
+        target_quat = tf_trans.quaternion_from_matrix(target_R)
+        target_yaw = tf_trans.euler_from_quaternion(target_quat)[2]
 
         # Create PoseStamped in body frame
         target_pose = PoseStamped()
-        target_pose.header.frame_id = "body"
+        target_pose.header.frame_id = "map"
         target_pose.header.stamp = self.get_clock().now().to_msg()
         target_pose.pose.position.x = target_x
         target_pose.pose.position.y = target_y
@@ -264,25 +248,24 @@ class SpotSyncTracking(Node):
 
         tf = TransformStamped()
         tf.header = copy.deepcopy(target_pose.header)
-        tf.header.frame_id = f"{spot_name}/body"
+        tf.header.frame_id = "map"
         tf.child_frame_id = f"{spot_name}/target_pose"
         tf.transform.translation.x = target_pose.pose.position.x
         tf.transform.translation.y = target_pose.pose.position.y
         tf.transform.translation.z = target_pose.pose.position.z
         tf.transform.rotation = target_pose.pose.orientation
-        
+        self.tf_publisher.sendTransform(tf)
+        self.get_logger().info(f"Target for {spot_name}: ({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg)")
 
-        self.tf_publisher.sendTransform(
-            tf
-        )
+        # transform target pose to robot frame
+        target_pose_body = self.tf_buffer.transform(target_pose, f"{spot_name}/body")
+        target_pose_body.header.frame_id = "body" # address spot ros2 msg no namespace issue
 
         self.get_logger().debug(
-            f"{spot_name}: target=({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg), "
-            f"vel=({total_linear_vel[0]:.2f}, {total_linear_vel[1]:.2f}), "
-            f"radius={radius:.2f}"
+            f"{spot_name}: target=({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg). "
         )
 
-        return target_pose
+        return target_pose_body
 
     def update_trajectories(self):
         """
