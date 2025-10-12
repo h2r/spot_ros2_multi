@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import copy
 from typing import Optional
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -10,7 +12,7 @@ import tf_transformations as tf_trans
 import numpy as np
 import threading
 
-from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
+from geometry_msgs.msg import Twist, TransformStamped, PoseStamped, Transform
 from builtin_interfaces.msg import Duration as DurationMsg
 from spot_msgs.action import Trajectory
 
@@ -58,6 +60,8 @@ class SpotSyncTracking(Node):
 
         self.spot_names = spot_names
         self.base_spot_name = spot_names[0]
+
+        self.mock = True
 
         # Create action clients for each robot
         self.trajectory_clients = {}
@@ -258,12 +262,18 @@ class SpotSyncTracking(Node):
         target_pose.pose.orientation.z = target_quat[2]
         target_pose.pose.orientation.w = target_quat[3]
 
+        tf = TransformStamped()
+        tf.header = copy.deepcopy(target_pose.header)
+        tf.header.frame_id = f"{spot_name}/body"
+        tf.child_frame_id = f"{spot_name}/target_pose"
+        tf.transform.translation.x = target_pose.pose.position.x
+        tf.transform.translation.y = target_pose.pose.position.y
+        tf.transform.translation.z = target_pose.pose.position.z
+        tf.transform.rotation = target_pose.pose.orientation
+        
+
         self.tf_publisher.sendTransform(
-            TransformStamped(
-                header=target_pose.header,
-                child_frame_id=f"{spot_name}_target_pose",
-                transform=target_pose.pose
-            )
+            tf
         )
 
         self.get_logger().debug(
@@ -346,6 +356,7 @@ class SpotSyncTracking(Node):
             goal.disable_obstacle_avoidance = False
 
             # Send goal asynchronously
+            if self.mock: continue
             client = self.trajectory_clients[spot_name]
             if not client.wait_for_server(timeout_sec=0.1):
                 self.get_logger().warn(f"Action server for {spot_name} not available")
