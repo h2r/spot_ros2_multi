@@ -63,7 +63,11 @@ endif()
 ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
-  scripts/spot_sync_drive.py
+  scripts/spot_sync_drive_position.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS
+  scripts/spot_sync_drive_velocity.py
   DESTINATION lib/${PROJECT_NAME}
 )
 install(PROGRAMS

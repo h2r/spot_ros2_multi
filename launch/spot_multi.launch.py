@@ -41,7 +41,7 @@ def generate_launch_description():
     # Synchronized Drive Node
     sync_drive_node = Node(
         package='spot_multi',
-        executable='spot_sync_drive.py',
+        executable='spot_sync_drive_position.py',
         name='spot_sync_drive',
         output='screen',
         parameters=[{
