@@ -100,7 +100,8 @@ class SpotSyncTracking(Node):
         self.stop_command_sent = False  # Track if we've already sent stop
 
         # Timer for periodic trajectory updates
-        self.update_rate = 10.0  # Hz - how often to send new trajectories
+        # Update rate should be less than 1/trajectory_duration to avoid flooding
+        self.update_rate = 5.0  # Hz - how often to send new trajectories (was 10.0)
         self.update_timer = self.create_timer(1.0 / self.update_rate, self.update_trajectories)
 
         self.get_logger().info(f"Initialized SpotSyncTracking for robots: {spot_names}")
@@ -141,6 +142,7 @@ class SpotSyncTracking(Node):
         """Compute and store transforms from each robot to the pivot frame"""
         if self.pivot_to_robot_R is not None: return
         with self.pivot_lock:
+            self.get_logger().info("--- New Command Session -- computing pivot transforms")
             self.pivot_to_robot_R = {}
             robot_pivot = np.array(list(robot_locs.values())).mean(axis=0)
             robot_pivot_R = np.eye(4)
@@ -256,6 +258,14 @@ class SpotSyncTracking(Node):
         target_pose.pose.orientation.z = target_quat[2]
         target_pose.pose.orientation.w = target_quat[3]
 
+        self.tf_publisher.sendTransform(
+            TransformStamped(
+                header=target_pose.header,
+                child_frame_id=f"{spot_name}_target_pose",
+                transform=target_pose.pose
+            )
+        )
+
         self.get_logger().debug(
             f"{spot_name}: target=({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg), "
             f"vel=({total_linear_vel[0]:.2f}, {total_linear_vel[1]:.2f}), "
@@ -269,6 +279,8 @@ class SpotSyncTracking(Node):
         Periodic callback to generate and send trajectory goals to all robots.
         This ensures continuous motion tracking of the cmd_vel input.
         """
+        if self.cmd_vel_lock.locked():
+            return # Avoid overlapping calls
         with self.cmd_vel_lock:
             cmd_vel = self.current_cmd_vel
             last_time = self.last_cmd_vel_time
@@ -330,8 +342,8 @@ class SpotSyncTracking(Node):
             duration_sec = int(self.trajectory_duration)
             duration_nsec = int((self.trajectory_duration - duration_sec) * 1e9)
             goal.duration = DurationMsg(sec=duration_sec, nanosec=duration_nsec)
-            goal.precise_positioning = False
-            goal.disable_obstacle_avoidance = True
+            goal.precise_positioning = True
+            goal.disable_obstacle_avoidance = False
 
             # Send goal asynchronously
             client = self.trajectory_clients[spot_name]
@@ -393,6 +405,12 @@ class SpotSyncTracking(Node):
             self.get_logger().debug(f"{robot_name} trajectory completed: {result.message}")
             self.trajectory_feedback[robot_name] = {
                 "status": "completed",
+                "message": result.message
+            }
+        elif result.message == "timeout":
+            self.get_logger().info(f"{robot_name} trajectory finished and canceled with new goal (expected): {result.message}")
+            self.trajectory_feedback[robot_name] = {
+                "status": "timeout",
                 "message": result.message
             }
         else:
