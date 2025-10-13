@@ -53,9 +53,9 @@ public:
 
         // Publisher for the merged point cloud
         publisher_full_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/spot/merged_points", 10);
+            "/multi_spot/lidar/merged_points", 10);
         publisher_realigned2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/spot/realigned2_points", 10);
+            "/spot2/realigned2_points", 10);
         publisher_pc2_tf_ = this->create_publisher<geometry_msgs::msg::TransformStamped>(
             "/multi_spot/pc2_realign_tf", 10);
 
