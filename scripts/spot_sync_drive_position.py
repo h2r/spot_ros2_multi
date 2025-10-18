@@ -76,6 +76,8 @@ class SpotSyncTracking(Node):
             client = ActionClient(self, Trajectory, f"/{spot_name}/trajectory")
             self.trajectory_clients[spot_name] = client
             self.trajectory_feedback[spot_name] = {"status": "idle", "message": ""}
+            # create a cmd_vel subscriber for each robot to reset pivot if their individual location is changed
+            self.create_subscription(Twist, f"/{spot_name}/cmd_vel", self._single_cmd_vel_callback, 1)
             self.get_logger().info(f"Created action client for {spot_name}")
 
         # TF setup
@@ -87,15 +89,16 @@ class SpotSyncTracking(Node):
         self.vel_subscriber = self.create_subscription(
             Twist,
             "/multi_spot/cmd_vel",
-            self.cmd_vel_callback,
+            self._cmd_vel_callback,
             1
         )
 
         # Parameters for trajectory generation
-        self.trajectory_duration = 1  # seconds - how far ahead to plan
-        self.max_linear_speed = 0.5  # m/s
+        self.trajectory_duration = 1.0  # seconds - how far ahead to plan
+        self.max_linear_speed = 0.3 # m/s
         self.max_angular_speed = 0.20  # rad/s
-        self.cmd_vel_timeout = 0.5  # seconds - stop if no cmd_vel received
+        self.stop_traj_timeout = 0.5  # seconds - stop if no cmd_vel received
+        self.reset_pivot_timeout = 5  # seconds - reset pivot if no cmd_vel received
 
         # Current velocity command
         self.current_cmd_vel = Twist()
@@ -106,12 +109,17 @@ class SpotSyncTracking(Node):
 
         # Timer for periodic trajectory updates
         # Update rate should be less than 1/trajectory_duration to avoid flooding
-        self.update_rate = 5.0  # Hz - how often to send new trajectories (was 10.0)
-        self.update_timer = self.create_timer(1.0 / self.update_rate, self.update_trajectories)
+        self.update_rate = 10.0  # Hz - how often to send new trajectories
+        self.update_timer = self.create_timer(1.0 / self.update_rate, self._update_trajectory_callback)
 
         self.get_logger().info(f"Initialized SpotSyncTracking for robots: {spot_names}")
+    
+    def _single_cmd_vel_callback(self, vel: Twist):
+        """Callback for single robot cmd_vel - not used in multi-robot setup"""
+        self.get_logger().info("Single_cmd_vel_callback called - Reset multi-robot pivot point.")
+        self._reset_pivot()
 
-    def cmd_vel_callback(self, vel: Twist):
+    def _cmd_vel_callback(self, vel: Twist):
         """Store the latest velocity command"""
         with self.cmd_vel_lock:
             self.current_cmd_vel = vel
@@ -122,7 +130,7 @@ class SpotSyncTracking(Node):
                 f"angular={vel.angular.z:.2f}"
             )
 
-    def get_robot_transforms(self):
+    def _get_robot_transforms(self):
         """Get current transforms for all robots in the map frame, dict of R and 3D locations"""
         robot_tfs = {}
         robot_locs = {}
@@ -142,8 +150,7 @@ class SpotSyncTracking(Node):
 
         return robot_tfs, robot_locs
 
-    
-    def compute_tf_to_pivot(self, robot_tfs, robot_locs):
+    def _compute_tf_to_pivot(self, robot_tfs, robot_locs):
         """Compute and store transforms from each robot to the pivot frame"""
         if self.pivot_to_robot_R is not None: return
         print(robot_locs)
@@ -161,8 +168,7 @@ class SpotSyncTracking(Node):
                 print(f"{spot_name} transform:\n{robot_tfs[spot_name]}")
                 self.pivot_to_robot_R[spot_name] = pivot_to_robot_R
 
-    
-    def compute_formation_pivot(self, robot_tfs, robot_locs):
+    def _compute_formation_pivot(self, robot_tfs, robot_locs):
         """
         Compute the pivot point for the robot formation.
         The pivot is at the centroid of all robots, with orientation from base robot.
@@ -178,7 +184,7 @@ class SpotSyncTracking(Node):
 
         return robot_pivot_R, robot_pivot
 
-    def send_stop_command(self):
+    def _send_stop_command(self):
         """
         Cancel all active trajectory goals to stop the robots.
         This is called when cmd_vel timeout is detected.
@@ -194,7 +200,7 @@ class SpotSyncTracking(Node):
             else:
                 self.get_logger().debug(f"No active trajectory to cancel for {spot_name}")
 
-    def compute_target_pose_for_robot(self, spot_name: str, robot_R: np.ndarray,
+    def _compute_target_pose_for_robot(self, spot_name: str, robot_R: np.ndarray,
                                       robot_pivot_R: np.ndarray, robot_pivot: np.ndarray, cmd_vel: Twist):
         """
         Compute target pose for a single robot based on formation velocity command.
@@ -210,13 +216,18 @@ class SpotSyncTracking(Node):
             PoseStamped in robot's body frame for the trajectory goal
         """
         assert self.pivot_to_robot_R is not None, "pivot_to_robot_R not computed"
-        # Get velocity components
-        global_linear_vel = np.array([cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.linear.z])
+        # Get velocity components in the pivot's body frame
+        body_linear_vel = np.array([cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.linear.z])
         angular_speed = cmd_vel.angular.z
+
+        # Transform velocity from pivot body frame to map frame
+        # The rotation matrix from the pivot gives us the orientation
+        body_to_map_rotation = robot_pivot_R[:3, :3]
+        map_linear_vel = body_to_map_rotation @ body_linear_vel
 
         # compute new location of the pivot after trajectory_duration
         dt = self.trajectory_duration
-        new_pivot = robot_pivot + global_linear_vel * dt
+        new_pivot = robot_pivot + map_linear_vel * dt
         rot_mat = np.eye(4)
         # rotate the pivot around the z axis
         if abs(angular_speed) > 0.001:
@@ -267,7 +278,14 @@ class SpotSyncTracking(Node):
 
         return target_pose_body
 
-    def update_trajectories(self):
+    def _reset_pivot(self):
+        """Reset the pivot transforms to force recomputation on next cmd_vel"""
+        with self.cmd_vel_lock:
+            self.last_cmd_vel_time = None
+            self.pivot_to_robot_R = None
+            self.get_logger().info("Pivot transforms reset")
+
+    def _update_trajectory_callback(self):
         """
         Periodic callback to generate and send trajectory goals to all robots.
         This ensures continuous motion tracking of the cmd_vel input.
@@ -281,16 +299,18 @@ class SpotSyncTracking(Node):
         # Check for timeout - stop robots if no cmd_vel received recently
         if last_time is not None:
             time_since_last_cmd = (self.get_clock().now() - last_time).nanoseconds / 1e9
-            if time_since_last_cmd > self.cmd_vel_timeout:
+            if time_since_last_cmd > self.stop_traj_timeout:
                 # Only send stop command once
                 if not self.stop_command_sent:
                     self.get_logger().warn(
-                        f"No cmd_vel received for {time_since_last_cmd:.2f}s (timeout: {self.cmd_vel_timeout}s) - stopping robots"
+                        f"No cmd_vel received for {time_since_last_cmd:.2f}s (timeout: {self.stop_traj_timeout}s) - stopping robots"
                     )
-                    self.send_stop_command()
-                    with self.cmd_vel_lock:
-                        self.pivot_to_robot_R = None  # Reset pivot transforms
-                        self.stop_command_sent = True
+                    self._send_stop_command()
+                if time_since_last_cmd > self.reset_pivot_timeout:
+                    self.get_logger().info(
+                        f"No cmd_vel received for {time_since_last_cmd:.2f}s (reset timeout: {self.reset_pivot_timeout}s) - resetting pivot"
+                    )
+                    self._reset_pivot()
                 return
 
         # If no cmd_vel ever received, don't send trajectories
@@ -304,14 +324,14 @@ class SpotSyncTracking(Node):
             return
 
         # Get current robot states
-        robot_tfs, robot_locs = self.get_robot_transforms()
+        robot_tfs, robot_locs = self._get_robot_transforms()
         if robot_tfs is None:
             return
 
         # Compute formation pivot
-        robot_pivot_R, robot_pivot = self.compute_formation_pivot(robot_tfs, robot_locs)
+        robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
         if self.pivot_to_robot_R is None:
-            self.compute_tf_to_pivot(robot_tfs, robot_locs)
+            self._compute_tf_to_pivot(robot_tfs, robot_locs)
 
         # Generate and send trajectory goals for each robot
         for spot_name in self.spot_names:
@@ -322,7 +342,7 @@ class SpotSyncTracking(Node):
             # cmd_vel was first received
             adjusted_robot_R = robot_pivot_R @ self.pivot_to_robot_R[spot_name]
             # Compute target pose
-            target_pose = self.compute_target_pose_for_robot(
+            target_pose = self._compute_target_pose_for_robot(
                 spot_name, adjusted_robot_R,
                 robot_pivot_R, robot_pivot, cmd_vel
             )
@@ -348,15 +368,15 @@ class SpotSyncTracking(Node):
             # Send goal with feedback callback
             send_goal_future = client.send_goal_async(
                 goal,
-                feedback_callback=lambda fb, name=spot_name: self.trajectory_feedback_callback(name, fb)
+                feedback_callback=lambda fb, name=spot_name: self._trajectory_feedback_callback(name, fb)
             )
             send_goal_future.add_done_callback(
-                lambda future, name=spot_name: self.trajectory_response_callback(name, future)
+                lambda future, name=spot_name: self._trajectory_response_callback(name, future)
             )
 
             self.get_logger().debug(f"Sent trajectory goal to {spot_name}")
 
-    def trajectory_feedback_callback(self, robot_name, feedback_msg):
+    def _trajectory_feedback_callback(self, robot_name, feedback_msg):
         """Process feedback from trajectory action"""
         feedback = feedback_msg.feedback
         self.trajectory_feedback[robot_name] = {
@@ -365,7 +385,7 @@ class SpotSyncTracking(Node):
         }
         self.get_logger().debug(f"{robot_name} feedback: {feedback.feedback}")
 
-    def trajectory_response_callback(self, robot_name, future):
+    def _trajectory_response_callback(self, robot_name, future):
         """Handle goal acceptance/rejection"""
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -385,10 +405,10 @@ class SpotSyncTracking(Node):
         # Get result when trajectory completes
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
-            lambda future, name=robot_name: self.trajectory_result_callback(name, future)
+            lambda future, name=robot_name: self._trajectory_result_callback(name, future)
         )
 
-    def trajectory_result_callback(self, robot_name, future):
+    def _trajectory_result_callback(self, robot_name, future):
         """Handle trajectory completion result"""
         result = future.result().result
 
