@@ -94,9 +94,9 @@ class SpotSyncTracking(Node):
         )
 
         # Parameters for trajectory generation
-        self.trajectory_duration = 1.0  # seconds - how far ahead to plan
-        self.max_linear_speed = 0.3 # m/s
-        self.max_angular_speed = 0.20  # rad/s
+        self.trajectory_duration = 0.5  # seconds - how far ahead to plan
+        self.max_linear_speed = 0.5 # m/s
+        self.max_angular_speed = 0.15  # rad/s
         self.stop_traj_timeout = 0.5  # seconds - stop if no cmd_vel received
         self.reset_pivot_timeout = 5  # seconds - reset pivot if no cmd_vel received
 
@@ -104,7 +104,7 @@ class SpotSyncTracking(Node):
         self.current_cmd_vel = Twist()
         self.last_cmd_vel_time = None
         self.cmd_vel_lock = threading.Lock()
-        self.pivot_lock = threading.Lock()
+        self.pivot_compute_lock = threading.Lock()
         self.stop_command_sent = False  # Track if we've already sent stop
 
         # Timer for periodic trajectory updates
@@ -155,7 +155,7 @@ class SpotSyncTracking(Node):
         """Compute and store transforms from each robot to the pivot frame"""
         if self.pivot_to_robot_R is not None: return
         print(robot_locs)
-        with self.pivot_lock:
+        with self.pivot_compute_lock:
             self.get_logger().info("--- New Command Session -- computing pivot transforms")
             self.pivot_to_robot_R = {}
             robot_pivot = np.array(list(robot_locs.values())).mean(axis=0)
@@ -193,29 +193,37 @@ class SpotSyncTracking(Node):
         for spot_name in self.spot_names:
             stop_client = self.stop_clients[spot_name]
             if stop_client.service_is_ready():
+                # request stop current execution
                 request = Trigger.Request()
                 future = stop_client.call_async(request)
-
                 # After stop completes, realign robot to current pivot
-                robot_tfs, robot_locs = self._get_robot_transforms()
-                robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
                 future.add_done_callback(
-                    lambda f, name=spot_name: self._realign_after_stop(name, robot_pivot_R) if f.result().success else None
+                    lambda f, name=spot_name: 
+                        self._realign_after_stop(
+                            name, 
+                            {"pivot_R": None, "pivot_pos": None} # shared pivot to be filled / used by both robots
+                        ) 
+                        if f.result().success else None
                 )
                 self.get_logger().info(f"Sent stop command to {spot_name}")
             else:
                 self.get_logger().warn(f"Stop service not ready for {spot_name}")
 
-    def _realign_after_stop(self, robot_name: str, robot_pivot_R: np.ndarray):
+    def _realign_after_stop(self, robot_name: str, pivot: dict[str, np.ndarray]=None):
         """
         After a stop command, realign the robot to the current pivot position.
         """
         robot_tfs, robot_locs = self._get_robot_transforms()
+        # shared object to be used by both robots. will be computed by the first stopped robot.
+        with self.pivot_compute_lock:
+            if pivot['pivot_R'] is None:
+                pivot['pivot_R'], pivot['pivot_pos'] = self._compute_formation_pivot(robot_tfs, robot_locs)
+        pivot_R, pivot_pos = pivot['pivot_R'], pivot['pivot_pos']
         pose = self._compute_target_pose_for_robot(
             robot_name,
             robot_tfs[robot_name],
-            robot_pivot_R,
-            robot_pivot_R[:3, 3],
+            pivot_R,
+            pivot_pos,
             Twist(),
             self.get_clock().now()
         )
