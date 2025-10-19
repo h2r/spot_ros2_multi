@@ -195,9 +195,33 @@ class SpotSyncTracking(Node):
             if stop_client.service_is_ready():
                 request = Trigger.Request()
                 future = stop_client.call_async(request)
+
+                # After stop completes, realign robot to current pivot
+                robot_tfs, robot_locs = self._get_robot_transforms()
+                robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
+                future.add_done_callback(
+                    lambda f, name=spot_name: self._realign_after_stop(name, robot_pivot_R) if f.result().success else None
+                )
                 self.get_logger().info(f"Sent stop command to {spot_name}")
             else:
                 self.get_logger().warn(f"Stop service not ready for {spot_name}")
+
+    def _realign_after_stop(self, robot_name: str, robot_pivot_R: np.ndarray):
+        """
+        After a stop command, realign the robot to the current pivot position.
+        """
+        robot_tfs, robot_locs = self._get_robot_transforms()
+        pose = self._compute_target_pose_for_robot(
+            robot_name,
+            robot_tfs[robot_name],
+            robot_pivot_R,
+            robot_pivot_R[:3, 3],
+            Twist(),
+            self.get_clock().now()
+        )
+        self.navigate_publishers[robot_name].publish(pose)
+        self.get_logger().info(f"Sent realign command to {robot_name} after stop.")
+
 
     def _compute_target_pose_for_robot(self, spot_name: str, robot_R: np.ndarray,
                                       robot_pivot_R: np.ndarray, robot_pivot: np.ndarray, cmd_vel: Twist,
@@ -303,6 +327,58 @@ class SpotSyncTracking(Node):
                 self.stop_command_sent = True
                 self.get_logger().info("Pivot transforms reset")
 
+    def execute_sync_drive(self, cmd_vel: Twist, req_stamp: rclpy.time.Time):
+        """
+        Execute synchronized driving for all robots based on a velocity command.
+
+        This is a pure function that takes velocity input and publishes synchronized
+        pose commands to all robots. It does not manage state like current_cmd_vel.
+
+        Args:
+            cmd_vel: Twist velocity command in the formation's reference frame
+            req_stamp: Timestamp for when this command was requested
+
+        Returns:
+            bool: True if commands were successfully sent, False otherwise
+        """
+        # If zero velocity, don't send new trajectories
+        if (abs(cmd_vel.linear.x) < 0.01 and
+            abs(cmd_vel.linear.y) < 0.01 and
+            abs(cmd_vel.angular.z) < 0.01):
+            return False
+
+        # Get current robot states
+        robot_tfs, robot_locs = self._get_robot_transforms()
+        if robot_tfs is None:
+            return False
+
+        # Compute formation pivot
+        robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
+        if self.pivot_to_robot_R is None:
+            self._compute_tf_to_pivot(robot_tfs, robot_locs)
+
+        # Generate and send trajectory poses for each robot (fire-and-forget)
+        for spot_name in self.spot_names:
+            if self.pivot_to_robot_R is None:
+                raise ValueError("pivot_to_robot_R not computed yet")
+
+            # adjust the robot position to be consistent with the inital pivot offset when the
+            # cmd_vel was first received
+            adjusted_robot_R = robot_pivot_R @ self.pivot_to_robot_R[spot_name]
+            # Compute target pose
+            target_pose = self._compute_target_pose_for_robot(
+                spot_name, adjusted_robot_R,
+                robot_pivot_R, robot_pivot, cmd_vel, req_stamp
+            )
+
+            # Publish pose to navigate_to_pose topic (fire-and-forget)
+            if not self.mock:
+                publisher = self.navigate_publishers[spot_name]
+                publisher.publish(target_pose)
+                self.get_logger().debug(f"Published navigate_to_pose for {spot_name}")
+
+        return True
+
     def _update_trajectory_callback(self):
         """
         Periodic callback to generate and send trajectory goals to all robots.
@@ -335,41 +411,8 @@ class SpotSyncTracking(Node):
         if last_time is None:
             return
 
-        # If zero velocity, don't send new trajectories
-        if (abs(cmd_vel.linear.x) < 0.01 and
-            abs(cmd_vel.linear.y) < 0.01 and
-            abs(cmd_vel.angular.z) < 0.01):
-            return
-
-        # Get current robot states
-        robot_tfs, robot_locs = self._get_robot_transforms()
-        if robot_tfs is None:
-            return
-
-        # Compute formation pivot
-        robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
-        if self.pivot_to_robot_R is None:
-            self._compute_tf_to_pivot(robot_tfs, robot_locs)
-
-        # Generate and send trajectory poses for each robot (fire-and-forget)
-        for spot_name in self.spot_names:
-            if self.pivot_to_robot_R is None:
-                raise ValueError("pivot_to_robot_R not computed yet")
-
-            # adjust the robot position to be consistent with the inital pivot offset when the
-            # cmd_vel was first received
-            adjusted_robot_R = robot_pivot_R @ self.pivot_to_robot_R[spot_name]
-            # Compute target pose
-            target_pose = self._compute_target_pose_for_robot(
-                spot_name, adjusted_robot_R,
-                robot_pivot_R, robot_pivot, cmd_vel, req_stamp
-            )
-
-            # Publish pose to navigate_to_pose topic (fire-and-forget)
-            if not self.mock:
-                publisher = self.navigate_publishers[spot_name]
-                publisher.publish(target_pose)
-                self.get_logger().debug(f"Published navigate_to_pose for {spot_name}")
+        # Execute the synchronized drive command
+        self.execute_sync_drive(cmd_vel, req_stamp)
 
 
 def main(args=None):
