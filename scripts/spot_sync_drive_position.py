@@ -41,6 +41,16 @@ def matrix_to_tf(R: np.ndarray, parent_frame: str, child_frame: str, node: Node)
     t.transform.rotation.w = rotation[3]
     return t
 
+def tf_to_pose(tf: TransformStamped) -> PoseStamped:
+    """Convert TransformStamped to PoseStamped"""
+    pose = PoseStamped()
+    pose.header = tf.header
+    pose.pose.position.x = tf.transform.translation.x
+    pose.pose.position.y = tf.transform.translation.y
+    pose.pose.position.z = tf.transform.translation.z
+    pose.pose.orientation = tf.transform.rotation
+    return pose
+
 
 class SpotSyncTracking(Node):
     """
@@ -63,6 +73,7 @@ class SpotSyncTracking(Node):
 
         # Create publishers and service clients for each robot
         self.navigate_publishers = {}
+        self.pivot_publisher = self.create_publisher(PoseStamped, "/multi_spot/robot_pivot", 1)
         self.stop_clients = {}
 
         self.pivot_to_robot_R: Optional[dict[str, np.ndarray]] = None
@@ -89,7 +100,7 @@ class SpotSyncTracking(Node):
         self.vel_subscriber = self.create_subscription(
             Twist,
             "/multi_spot/cmd_vel",
-            self._cmd_vel_callback,
+            self._multi_cmd_vel_callback,
             1
         )
 
@@ -118,7 +129,7 @@ class SpotSyncTracking(Node):
         """Callback for single robot cmd_vel - not used in multi-robot setup"""
         self._reset_pivot()
 
-    def _cmd_vel_callback(self, vel: Twist):
+    def _multi_cmd_vel_callback(self, vel: Twist):
         """Store the latest velocity command"""
         if self.cmd_vel_lock.locked():
             return # Avoid overlapping calls
@@ -151,37 +162,48 @@ class SpotSyncTracking(Node):
 
         return robot_tfs, robot_locs
 
-    def _compute_tf_to_pivot(self, robot_tfs, robot_locs):
+    def _compute_tf_to_pivot(self, robot_tfs, robot_locs, robot_pivot_R, robot_pivot):
         """Compute and store transforms from each robot to the pivot frame"""
         if self.pivot_to_robot_R is not None: return
-        print(robot_locs)
-        with self.pivot_compute_lock:
-            self.get_logger().info("--- New Command Session -- computing pivot transforms")
-            self.pivot_to_robot_R = {}
-            robot_pivot = np.array(list(robot_locs.values())).mean(axis=0)
-            robot_pivot_R = np.eye(4)
-            robot_pivot_R[:3, :3] = robot_tfs[self.base_spot_name][:3, :3]
-            robot_pivot_R[:3, 3] = robot_pivot
-            print(f"Robot pivot at: {robot_pivot}")
-            for spot_name in self.spot_names:
-                pivot_to_robot_R = np.linalg.solve(robot_pivot_R, robot_tfs[spot_name])
-                print(f"{spot_name} pivot offset: {pivot_to_robot_R[:3,3]}")
-                print(f"{spot_name} transform:\n{robot_tfs[spot_name]}")
-                self.pivot_to_robot_R[spot_name] = pivot_to_robot_R
+
+        self.get_logger().info("--- New Command Session -- computing pivot transforms")
+        self.pivot_to_robot_R = {}
+        for spot_name in self.spot_names:
+            pivot_to_robot_R = np.linalg.solve(robot_pivot_R, robot_tfs[spot_name])
+            print(f"{spot_name} pivot offset: {pivot_to_robot_R[:3,3]}")
+            print(f"{spot_name} transform:\n{robot_tfs[spot_name]}")
+            self.pivot_to_robot_R[spot_name] = pivot_to_robot_R
 
     def _compute_formation_pivot(self, robot_tfs, robot_locs):
         """
         Compute the pivot point for the robot formation.
-        The pivot is at the centroid of all robots, with orientation from base robot.
+        The pivot is at the centroid of all robots, with orientation as the average yaw.
         """
         robot_pivot = np.array(list(robot_locs.values())).mean(axis=0)
+
+        # Compute average yaw from all robots.
+        # it is only possible for yaw to be extracted like this meaningfully, due to rotation order.
+        yaws = []
+        for spot_name in self.spot_names:
+            quat = tf_trans.quaternion_from_matrix(robot_tfs[spot_name])
+            _, _, yaw = tf_trans.euler_from_quaternion(quat)
+            yaws.append(yaw)
+
+        # Average the yaw angles (handling wraparound)
+        avg_yaw = np.arctan2(
+            np.mean([np.sin(y) for y in yaws]),
+            np.mean([np.cos(y) for y in yaws])
+        )
+
+        # Create rotation matrix with average yaw, zero roll and pitch
         robot_pivot_R = np.eye(4)
-        robot_pivot_R[:3, :3] = robot_tfs[self.base_spot_name][:3, :3]
+        robot_pivot_R[:3, :3] = tf_trans.euler_matrix(0, 0, avg_yaw)[:3, :3]
         robot_pivot_R[:3, 3] = robot_pivot
 
         # Broadcast the pivot frame for visualization
         robot_pivot_tf = matrix_to_tf(robot_pivot_R, "map", "robot_pivot", self)
         self.tf_publisher.sendTransform(robot_pivot_tf)
+        self.pivot_publisher.publish(tf_to_pose(robot_pivot_tf))
 
         return robot_pivot_R, robot_pivot
 
@@ -361,9 +383,10 @@ class SpotSyncTracking(Node):
             return False
 
         # Compute formation pivot
-        robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
-        if self.pivot_to_robot_R is None:
-            self._compute_tf_to_pivot(robot_tfs, robot_locs)
+        with self.pivot_compute_lock:
+            robot_pivot_R, robot_pivot = self._compute_formation_pivot(robot_tfs, robot_locs)
+            if self.pivot_to_robot_R is None:
+                self._compute_tf_to_pivot(robot_tfs, robot_locs, robot_pivot_R, robot_pivot)
 
         # Generate and send trajectory poses for each robot (fire-and-forget)
         for spot_name in self.spot_names:
