@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
-import copy
 from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
 from rclpy.duration import Duration
 import tf2_ros
 import tf2_geometry_msgs  # Required for PoseStamped transformations
@@ -14,8 +12,7 @@ import numpy as np
 import threading
 
 from geometry_msgs.msg import Twist, TransformStamped, PoseStamped, Transform
-from builtin_interfaces.msg import Duration as DurationMsg
-from spot_msgs.action import Trajectory
+from std_srvs.srv import Trigger
 
 def tf_to_matrix(tf: TransformStamped):
     """Convert TransformStamped to 4x4 transformation matrix"""
@@ -47,13 +44,13 @@ def matrix_to_tf(R: np.ndarray, parent_frame: str, child_frame: str, node: Node)
 
 class SpotSyncTracking(Node):
     """
-    Multi-robot synchronized tracking controller using trajectory actions.
+    Multi-robot synchronized tracking controller using fire-and-forget navigate_to_pose.
 
     This node:
     - Subscribes to /multi_spot/cmd_vel for formation velocity commands
     - Integrates velocities to generate trajectory waypoints
-    - Sends synchronized trajectory goals to each robot via actions
-    - Monitors feedback to maintain formation synchronization
+    - Sends synchronized pose commands to each robot via navigate_to_pose topic
+    - Uses stop service for immediate halt
     """
 
     def __init__(self, spot_names):
@@ -64,24 +61,27 @@ class SpotSyncTracking(Node):
 
         self.mock = False
 
-        # Create action clients for each robot
-        self.trajectory_clients = {}
-        self.trajectory_goals = {}
-        self.trajectory_futures = {}
-        self.trajectory_feedback = {}
+        # Create publishers and service clients for each robot
+        self.navigate_publishers = {}
+        self.stop_clients = {}
 
         self.pivot_to_robot_R: Optional[dict[str, np.ndarray]] = None
 
         for spot_name in spot_names:
-            client = ActionClient(self, Trajectory, f"/{spot_name}/trajectory")
-            self.trajectory_clients[spot_name] = client
-            self.trajectory_feedback[spot_name] = {"status": "idle", "message": ""}
+            # Create publisher for navigate_to_pose
+            pub = self.create_publisher(PoseStamped, f"/{spot_name}/navigate_to_pose", 1)
+            self.navigate_publishers[spot_name] = pub
+
+            # Create service client for stop
+            stop_client = self.create_client(Trigger, f"/{spot_name}/stop")
+            self.stop_clients[spot_name] = stop_client
+
             # create a cmd_vel subscriber for each robot to reset pivot if their individual location is changed
             self.create_subscription(Twist, f"/{spot_name}/cmd_vel", self._single_cmd_vel_callback, 1)
-            self.get_logger().info(f"Created action client for {spot_name}")
+            self.get_logger().info(f"Created navigate_to_pose publisher for {spot_name}")
 
         # TF setup
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(nanoseconds=int(5e8)))
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=2))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_publisher = tf2_ros.TransformBroadcaster(self)
 
@@ -116,11 +116,12 @@ class SpotSyncTracking(Node):
     
     def _single_cmd_vel_callback(self, vel: Twist):
         """Callback for single robot cmd_vel - not used in multi-robot setup"""
-        self.get_logger().info("Single_cmd_vel_callback called - Reset multi-robot pivot point.")
         self._reset_pivot()
 
     def _cmd_vel_callback(self, vel: Twist):
         """Store the latest velocity command"""
+        if self.cmd_vel_lock.locked():
+            return # Avoid overlapping calls
         with self.cmd_vel_lock:
             self.current_cmd_vel = vel
             self.last_cmd_vel_time = self.get_clock().now()
@@ -186,22 +187,21 @@ class SpotSyncTracking(Node):
 
     def _send_stop_command(self):
         """
-        Cancel all active trajectory goals to stop the robots.
+        Call stop service for all robots to halt them immediately.
         This is called when cmd_vel timeout is detected.
         """
         for spot_name in self.spot_names:
-            # Cancel any active goal for this robot
-            if spot_name in self.trajectory_goals and self.trajectory_goals[spot_name] is not None:
-                goal_handle = self.trajectory_goals[spot_name]
-                goal_handle.cancel_goal_async()
-                self.get_logger().info(f"Cancelling active trajectory for {spot_name}")
-                # Clear the goal handle
-                self.trajectory_goals[spot_name] = None
+            stop_client = self.stop_clients[spot_name]
+            if stop_client.service_is_ready():
+                request = Trigger.Request()
+                future = stop_client.call_async(request)
+                self.get_logger().info(f"Sent stop command to {spot_name}")
             else:
-                self.get_logger().debug(f"No active trajectory to cancel for {spot_name}")
+                self.get_logger().warn(f"Stop service not ready for {spot_name}")
 
     def _compute_target_pose_for_robot(self, spot_name: str, robot_R: np.ndarray,
-                                      robot_pivot_R: np.ndarray, robot_pivot: np.ndarray, cmd_vel: Twist):
+                                      robot_pivot_R: np.ndarray, robot_pivot: np.ndarray, cmd_vel: Twist,
+                                      req_stamp: rclpy.time.Time) -> PoseStamped:
         """
         Compute target pose for a single robot based on formation velocity command.
 
@@ -213,9 +213,10 @@ class SpotSyncTracking(Node):
             cmd_vel: Formation velocity command
 
         Returns:
-            PoseStamped in robot's body frame for the trajectory goal
+            PoseStamped in map frame with timestamp for synchronized arrival
         """
         assert self.pivot_to_robot_R is not None, "pivot_to_robot_R not computed"
+        assert req_stamp is not None and type(req_stamp) is rclpy.time.Time, "req_stamp must be provided"
         # Get velocity components in the pivot's body frame
         body_linear_vel = np.array([cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.linear.z])
         angular_speed = cmd_vel.angular.z
@@ -245,56 +246,72 @@ class SpotSyncTracking(Node):
         target_quat = tf_trans.quaternion_from_matrix(target_R)
         target_yaw = tf_trans.euler_from_quaternion(target_quat)[2]
 
-        # Create PoseStamped in body frame
-        target_pose = PoseStamped()
-        target_pose.header.frame_id = "map"
-        target_pose.header.stamp = self.get_clock().now().to_msg()
-        target_pose.pose.position.x = target_x
-        target_pose.pose.position.y = target_y
-        target_pose.pose.position.z = target_z
-        target_pose.pose.orientation.x = target_quat[0]
-        target_pose.pose.orientation.y = target_quat[1]
-        target_pose.pose.orientation.z = target_quat[2]
-        target_pose.pose.orientation.w = target_quat[3]
+        # Create PoseStamped in map frame first
+        target_pose_map = PoseStamped()
+        target_pose_map.header.frame_id = "map"
+        target_pose_map.header.stamp = rclpy.time.Time().to_msg()
+        target_pose_map.pose.position.x = target_x
+        target_pose_map.pose.position.y = target_y
+        target_pose_map.pose.position.z = target_z
+        target_pose_map.pose.orientation.x = target_quat[0]
+        target_pose_map.pose.orientation.y = target_quat[1]
+        target_pose_map.pose.orientation.z = target_quat[2]
+        target_pose_map.pose.orientation.w = target_quat[3]
 
+        # Transform to robot's body frame
+        try:
+            target_pose = self.tf_buffer.transform(target_pose_map, f"{spot_name}/body", timeout=Duration(nanoseconds=int(2e8)))
+            # Update timestamp to when robot should arrive (for synchronized execution)
+            target_pose.header.stamp = (req_stamp + Duration(seconds=dt)).to_msg()
+            # Keep frame_id as body for the command
+            target_pose.header.frame_id = "body"  # Remove namespace for spot_ros2 compatibility
+
+            self.get_logger().debug(f"Transformed target pose to {spot_name}/body frame")
+        except Exception as e:
+            self.get_logger().error(f"Failed to transform target pose to {spot_name}/body: {e}. Using map frame.")
+            target_pose = target_pose_map
+            # Set timestamp for synchronized arrival
+            target_pose.header.stamp = (self.get_clock().now() + Duration(seconds=dt)).to_msg()
+
+        # Publish TF for visualization (in map frame)
         tf = TransformStamped()
-        tf.header = copy.deepcopy(target_pose.header)
+        tf.header.stamp = self.get_clock().now().to_msg()
         tf.header.frame_id = "map"
         tf.child_frame_id = f"{spot_name}/target_pose"
-        tf.transform.translation.x = target_pose.pose.position.x
-        tf.transform.translation.y = target_pose.pose.position.y
-        tf.transform.translation.z = target_pose.pose.position.z
-        tf.transform.rotation = target_pose.pose.orientation
+        tf.transform.translation.x = target_x
+        tf.transform.translation.y = target_y
+        tf.transform.translation.z = target_z
+        tf.transform.rotation.x = target_quat[0]
+        tf.transform.rotation.y = target_quat[1]
+        tf.transform.rotation.z = target_quat[2]
+        tf.transform.rotation.w = target_quat[3]
         self.tf_publisher.sendTransform(tf)
-        self.get_logger().info(f"Target for {spot_name}: ({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg)")
-
-        # transform target pose to robot frame
-        target_pose_body = self.tf_buffer.transform(target_pose, f"{spot_name}/body")
-        target_pose_body.header.frame_id = "body" # address spot ros2 msg no namespace issue
+        self.get_logger().info(f"Target for {spot_name}: ({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg) in map frame")
 
         self.get_logger().debug(
             f"{spot_name}: target=({target_x:.2f}, {target_y:.2f}, {np.degrees(target_yaw):.1f}deg). "
         )
 
-        return target_pose_body
+        return target_pose
 
     def _reset_pivot(self):
         """Reset the pivot transforms to force recomputation on next cmd_vel"""
         with self.cmd_vel_lock:
-            self.last_cmd_vel_time = None
-            self.pivot_to_robot_R = None
-            self.get_logger().info("Pivot transforms reset")
+            if self.last_cmd_vel_time is not None:
+                self.last_cmd_vel_time = None
+                self.pivot_to_robot_R = None
+                self.stop_command_sent = True
+                self.get_logger().info("Pivot transforms reset")
 
     def _update_trajectory_callback(self):
         """
         Periodic callback to generate and send trajectory goals to all robots.
         This ensures continuous motion tracking of the cmd_vel input.
         """
-        if self.cmd_vel_lock.locked():
-            return # Avoid overlapping calls
         with self.cmd_vel_lock:
             cmd_vel = self.current_cmd_vel
             last_time = self.last_cmd_vel_time
+        req_stamp = self.get_clock().now()
 
         # Check for timeout - stop robots if no cmd_vel received recently
         if last_time is not None:
@@ -306,6 +323,7 @@ class SpotSyncTracking(Node):
                         f"No cmd_vel received for {time_since_last_cmd:.2f}s (timeout: {self.stop_traj_timeout}s) - stopping robots"
                     )
                     self._send_stop_command()
+                    self.stop_command_sent = True
                 if time_since_last_cmd > self.reset_pivot_timeout:
                     self.get_logger().info(
                         f"No cmd_vel received for {time_since_last_cmd:.2f}s (reset timeout: {self.reset_pivot_timeout}s) - resetting pivot"
@@ -333,7 +351,7 @@ class SpotSyncTracking(Node):
         if self.pivot_to_robot_R is None:
             self._compute_tf_to_pivot(robot_tfs, robot_locs)
 
-        # Generate and send trajectory goals for each robot
+        # Generate and send trajectory poses for each robot (fire-and-forget)
         for spot_name in self.spot_names:
             if self.pivot_to_robot_R is None:
                 raise ValueError("pivot_to_robot_R not computed yet")
@@ -344,104 +362,14 @@ class SpotSyncTracking(Node):
             # Compute target pose
             target_pose = self._compute_target_pose_for_robot(
                 spot_name, adjusted_robot_R,
-                robot_pivot_R, robot_pivot, cmd_vel
+                robot_pivot_R, robot_pivot, cmd_vel, req_stamp
             )
 
-            # Create trajectory goal
-            goal = Trajectory.Goal()
-            goal.target_pose = target_pose
-            self.get_logger().info(f"   Goal for {spot_name}: {goal.target_pose.pose}")
-            # Convert duration to seconds and nanoseconds
-            duration_sec = int(self.trajectory_duration)
-            duration_nsec = int((self.trajectory_duration - duration_sec) * 1e9)
-            goal.duration = DurationMsg(sec=duration_sec, nanosec=duration_nsec)
-            goal.precise_positioning = True
-            goal.disable_obstacle_avoidance = False
-
-            # Send goal asynchronously
-            if self.mock: continue
-            client = self.trajectory_clients[spot_name]
-            if not client.wait_for_server(timeout_sec=0.1):
-                self.get_logger().warn(f"Action server for {spot_name} not available")
-                continue
-
-            # Send goal with feedback callback
-            send_goal_future = client.send_goal_async(
-                goal,
-                feedback_callback=lambda fb, name=spot_name: self._trajectory_feedback_callback(name, fb)
-            )
-            send_goal_future.add_done_callback(
-                lambda future, name=spot_name: self._trajectory_response_callback(name, future)
-            )
-
-            self.get_logger().debug(f"Sent trajectory goal to {spot_name}")
-
-    def _trajectory_feedback_callback(self, robot_name, feedback_msg):
-        """Process feedback from trajectory action"""
-        feedback = feedback_msg.feedback
-        self.trajectory_feedback[robot_name] = {
-            "status": "executing",
-            "message": feedback.feedback
-        }
-        self.get_logger().debug(f"{robot_name} feedback: {feedback.feedback}")
-
-    def _trajectory_response_callback(self, robot_name, future):
-        """Handle goal acceptance/rejection"""
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn(f"{robot_name} trajectory goal rejected!")
-            self.trajectory_feedback[robot_name] = {
-                "status": "rejected",
-                "message": "Goal rejected"
-            }
-            self.trajectory_goals[robot_name] = None
-            return
-
-        self.get_logger().debug(f"{robot_name} trajectory goal accepted")
-
-        # Store the goal handle so we can cancel it later if needed
-        self.trajectory_goals[robot_name] = goal_handle
-
-        # Get result when trajectory completes
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda future, name=robot_name: self._trajectory_result_callback(name, future)
-        )
-
-    def _trajectory_result_callback(self, robot_name, future):
-        """Handle trajectory completion result"""
-        result = future.result().result
-
-        # Clear the goal handle since execution is complete
-        self.trajectory_goals[robot_name] = None
-
-        if result.success:
-            self.get_logger().debug(f"{robot_name} trajectory completed: {result.message}")
-            self.trajectory_feedback[robot_name] = {
-                "status": "completed",
-                "message": result.message
-            }
-        elif result.message == "timeout":
-            self.get_logger().info(f"{robot_name} trajectory finished and canceled with new goal (expected): {result.message}")
-            self.trajectory_feedback[robot_name] = {
-                "status": "timeout",
-                "message": result.message
-            }
-        else:
-            self.get_logger().warn(f"{robot_name} trajectory failed: {result.message}")
-            self.trajectory_feedback[robot_name] = {
-                "status": "failed",
-                "message": result.message
-            }
-
-    def get_formation_status(self):
-        """Get synchronization status of all robots"""
-        statuses = [fb["status"] for fb in self.trajectory_feedback.values()]
-        return {
-            "all_executing": all(s == "executing" for s in statuses),
-            "any_failed": any(s == "failed" for s in statuses),
-            "details": self.trajectory_feedback
-        }
+            # Publish pose to navigate_to_pose topic (fire-and-forget)
+            if not self.mock:
+                publisher = self.navigate_publishers[spot_name]
+                publisher.publish(target_pose)
+                self.get_logger().debug(f"Published navigate_to_pose for {spot_name}")
 
 
 def main(args=None):
