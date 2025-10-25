@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
+import json
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
@@ -23,6 +24,12 @@ def generate_launch_description():
         'graph_path',
         default_value='~/spot_configs/map/demo',
         description='Path to GraphNav map files'
+    )
+
+    update_rate_arg = DeclareLaunchArgument(
+        'update_rate',
+        default_value='0.1',
+        description='Rate (in seconds) for service translator to check for new requests'
     )
 
     # GraphNav Localization Node
@@ -57,11 +64,35 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Function to create gripper translator nodes for each spot
+    def launch_setup(context, *args, **kwargs):
+        spot_names_str = context.launch_configurations['spot_names']
+        spot_names = json.loads(spot_names_str)
+        update_rate = LaunchConfiguration('update_rate')
+
+        translator_nodes = []
+        for spot_name in spot_names:
+            translator_node = Node(
+                package='spot_multi',
+                executable='gripper_angle_translator.py',
+                name=f'gripper_angle_translator_{spot_name}',
+                output='screen',
+                parameters=[{
+                    'spot_name': spot_name,
+                    'update_rate': update_rate,
+                }]
+            )
+            translator_nodes.append(translator_node)
+
+        return translator_nodes
+
     return LaunchDescription([
         spot_names_arg,
         pivot_spot_arg,
         graph_path_arg,
+        update_rate_arg,
         graphnav_loc_node,
         sync_drive_node,
         point_cloud_processor_node,
+        OpaqueFunction(function=launch_setup),
     ])

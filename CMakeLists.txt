@@ -74,5 +74,9 @@ install(PROGRAMS
   scripts/spot_graphnav_loc.py
   DESTINATION lib/${PROJECT_NAME}
 )
+install(PROGRAMS
+  scripts/gripper_angle_translator.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()
